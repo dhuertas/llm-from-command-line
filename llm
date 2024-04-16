@@ -1,0 +1,707 @@
+#!/usr/bin/env python3
+
+import argparse
+import atexit
+import base64
+import bs4
+import datetime
+import httpx
+import io
+import json
+import operator
+import os
+import pprint
+import re
+import requests
+import sys
+import texttable
+import urllib
+
+# Constants
+ollama_url = "http://localhost:11434"
+ollama_chat_model = "openhermes"
+ollama_conf_dir = os.path.join(os.path.expanduser("~"), ".llm")
+ollama_chat_dir = os.path.join(os.path.expanduser("~"), ".llm/chat/")
+default_topic = "default"
+
+search_num_results = 3
+search_num_keywords = 3
+
+state = None
+secrets = None
+opts = None
+
+headers = {
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7", 
+    "Accept-Encoding": "gzip, deflate, br, zstd", 
+    "Accept-Language": "en-US,en;q=0.9", 
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36", 
+  }
+
+# ----------------------------------------------------------------------------------------------------------------------
+# Base64-encoded list of stop words
+smart_stop_list = "".join([
+    "I3N0b3Agd29yZCBsaXN0IGZyb20gU01BUlQgKFNhbHRvbiwxOTcxKS4gIEF2YWlsYWJsZSBhdCBm",
+    "dHA6Ly9mdHAuY3MuY29ybmVsbC5lZHUvcHViL3NtYXJ0L2VuZ2xpc2guc3RvcAphCmEncwphYmxl",
+    "CmFib3V0CmFib3ZlCmFjY29yZGluZwphY2NvcmRpbmdseQphY3Jvc3MKYWN0dWFsbHkKYWZ0ZXIK",
+    "YWZ0ZXJ3YXJkcwphZ2FpbgphZ2FpbnN0CmFpbid0CmFsbAphbGxvdwphbGxvd3MKYWxtb3N0CmFs",
+    "b25lCmFsb25nCmFscmVhZHkKYWxzbwphbHRob3VnaAphbHdheXMKYW0KYW1vbmcKYW1vbmdzdAph",
+    "bgphbmQKYW5vdGhlcgphbnkKYW55Ym9keQphbnlob3cKYW55b25lCmFueXRoaW5nCmFueXdheQph",
+    "bnl3YXlzCmFueXdoZXJlCmFwYXJ0CmFwcGVhcgphcHByZWNpYXRlCmFwcHJvcHJpYXRlCmFyZQph",
+    "cmVuJ3QKYXJvdW5kCmFzCmFzaWRlCmFzawphc2tpbmcKYXNzb2NpYXRlZAphdAphdmFpbGFibGUK",
+    "YXdheQphd2Z1bGx5CmIKYmUKYmVjYW1lCmJlY2F1c2UKYmVjb21lCmJlY29tZXMKYmVjb21pbmcK",
+    "YmVlbgpiZWZvcmUKYmVmb3JlaGFuZApiZWhpbmQKYmVpbmcKYmVsaWV2ZQpiZWxvdwpiZXNpZGUK",
+    "YmVzaWRlcwpiZXN0CmJldHRlcgpiZXR3ZWVuCmJleW9uZApib3RoCmJyaWVmCmJ1dApieQpjCmMn",
+    "bW9uCmMncwpjYW1lCmNhbgpjYW4ndApjYW5ub3QKY2FudApjYXVzZQpjYXVzZXMKY2VydGFpbgpj",
+    "ZXJ0YWlubHkKY2hhbmdlcwpjbGVhcmx5CmNvCmNvbQpjb21lCmNvbWVzCmNvbmNlcm5pbmcKY29u",
+    "c2VxdWVudGx5CmNvbnNpZGVyCmNvbnNpZGVyaW5nCmNvbnRhaW4KY29udGFpbmluZwpjb250YWlu",
+    "cwpjb3JyZXNwb25kaW5nCmNvdWxkCmNvdWxkbid0CmNvdXJzZQpjdXJyZW50bHkKZApkZWZpbml0",
+    "ZWx5CmRlc2NyaWJlZApkZXNwaXRlCmRpZApkaWRuJ3QKZGlmZmVyZW50CmRvCmRvZXMKZG9lc24n",
+    "dApkb2luZwpkb24ndApkb25lCmRvd24KZG93bndhcmRzCmR1cmluZwplCmVhY2gKZWR1CmVnCmVp",
+    "Z2h0CmVpdGhlcgplbHNlCmVsc2V3aGVyZQplbm91Z2gKZW50aXJlbHkKZXNwZWNpYWxseQpldApl",
+    "dGMKZXZlbgpldmVyCmV2ZXJ5CmV2ZXJ5Ym9keQpldmVyeW9uZQpldmVyeXRoaW5nCmV2ZXJ5d2hl",
+    "cmUKZXgKZXhhY3RseQpleGFtcGxlCmV4Y2VwdApmCmZhcgpmZXcKZmlmdGgKZmlyc3QKZml2ZQpm",
+    "b2xsb3dlZApmb2xsb3dpbmcKZm9sbG93cwpmb3IKZm9ybWVyCmZvcm1lcmx5CmZvcnRoCmZvdXIK",
+    "ZnJvbQpmdXJ0aGVyCmZ1cnRoZXJtb3JlCmcKZ2V0CmdldHMKZ2V0dGluZwpnaXZlbgpnaXZlcwpn",
+    "bwpnb2VzCmdvaW5nCmdvbmUKZ290CmdvdHRlbgpncmVldGluZ3MKaApoYWQKaGFkbid0CmhhcHBl",
+    "bnMKaGFyZGx5CmhhcwpoYXNuJ3QKaGF2ZQpoYXZlbid0CmhhdmluZwpoZQpoZSdzCmhlbGxvCmhl",
+    "bHAKaGVuY2UKaGVyCmhlcmUKaGVyZSdzCmhlcmVhZnRlcgpoZXJlYnkKaGVyZWluCmhlcmV1cG9u",
+    "CmhlcnMKaGVyc2VsZgpoaQpoaW0KaGltc2VsZgpoaXMKaGl0aGVyCmhvcGVmdWxseQpob3cKaG93",
+    "YmVpdApob3dldmVyCmkKaSdkCmknbGwKaSdtCmkndmUKaWUKaWYKaWdub3JlZAppbW1lZGlhdGUK",
+    "aW4KaW5hc211Y2gKaW5jCmluZGVlZAppbmRpY2F0ZQppbmRpY2F0ZWQKaW5kaWNhdGVzCmlubmVy",
+    "Cmluc29mYXIKaW5zdGVhZAppbnRvCmlud2FyZAppcwppc24ndAppdAppdCdkCml0J2xsCml0J3MK",
+    "aXRzCml0c2VsZgpqCmp1c3QKawprZWVwCmtlZXBzCmtlcHQKa25vdwprbm93cwprbm93bgpsCmxh",
+    "c3QKbGF0ZWx5CmxhdGVyCmxhdHRlcgpsYXR0ZXJseQpsZWFzdApsZXNzCmxlc3QKbGV0CmxldCdz",
+    "Cmxpa2UKbGlrZWQKbGlrZWx5CmxpdHRsZQpsb29rCmxvb2tpbmcKbG9va3MKbHRkCm0KbWFpbmx5",
+    "Cm1hbnkKbWF5Cm1heWJlCm1lCm1lYW4KbWVhbndoaWxlCm1lcmVseQptaWdodAptb3JlCm1vcmVv",
+    "dmVyCm1vc3QKbW9zdGx5Cm11Y2gKbXVzdApteQpteXNlbGYKbgpuYW1lCm5hbWVseQpuZApuZWFy",
+    "Cm5lYXJseQpuZWNlc3NhcnkKbmVlZApuZWVkcwpuZWl0aGVyCm5ldmVyCm5ldmVydGhlbGVzcwpu",
+    "ZXcKbmV4dApuaW5lCm5vCm5vYm9keQpub24Kbm9uZQpub29uZQpub3IKbm9ybWFsbHkKbm90Cm5v",
+    "dGhpbmcKbm92ZWwKbm93Cm5vd2hlcmUKbwpvYnZpb3VzbHkKb2YKb2ZmCm9mdGVuCm9oCm9rCm9r",
+    "YXkKb2xkCm9uCm9uY2UKb25lCm9uZXMKb25seQpvbnRvCm9yCm90aGVyCm90aGVycwpvdGhlcndp",
+    "c2UKb3VnaHQKb3VyCm91cnMKb3Vyc2VsdmVzCm91dApvdXRzaWRlCm92ZXIKb3ZlcmFsbApvd24K",
+    "cApwYXJ0aWN1bGFyCnBhcnRpY3VsYXJseQpwZXIKcGVyaGFwcwpwbGFjZWQKcGxlYXNlCnBsdXMK",
+    "cG9zc2libGUKcHJlc3VtYWJseQpwcm9iYWJseQpwcm92aWRlcwpxCnF1ZQpxdWl0ZQpxdgpyCnJh",
+    "dGhlcgpyZApyZQpyZWFsbHkKcmVhc29uYWJseQpyZWdhcmRpbmcKcmVnYXJkbGVzcwpyZWdhcmRz",
+    "CnJlbGF0aXZlbHkKcmVzcGVjdGl2ZWx5CnJpZ2h0CnMKc2FpZApzYW1lCnNhdwpzYXkKc2F5aW5n",
+    "CnNheXMKc2Vjb25kCnNlY29uZGx5CnNlZQpzZWVpbmcKc2VlbQpzZWVtZWQKc2VlbWluZwpzZWVt",
+    "cwpzZWVuCnNlbGYKc2VsdmVzCnNlbnNpYmxlCnNlbnQKc2VyaW91cwpzZXJpb3VzbHkKc2V2ZW4K",
+    "c2V2ZXJhbApzaGFsbApzaGUKc2hvdWxkCnNob3VsZG4ndApzaW5jZQpzaXgKc28Kc29tZQpzb21l",
+    "Ym9keQpzb21laG93CnNvbWVvbmUKc29tZXRoaW5nCnNvbWV0aW1lCnNvbWV0aW1lcwpzb21ld2hh",
+    "dApzb21ld2hlcmUKc29vbgpzb3JyeQpzcGVjaWZpZWQKc3BlY2lmeQpzcGVjaWZ5aW5nCnN0aWxs",
+    "CnN1YgpzdWNoCnN1cApzdXJlCnQKdCdzCnRha2UKdGFrZW4KdGVsbAp0ZW5kcwp0aAp0aGFuCnRo",
+    "YW5rCnRoYW5rcwp0aGFueAp0aGF0CnRoYXQncwp0aGF0cwp0aGUKdGhlaXIKdGhlaXJzCnRoZW0K",
+    "dGhlbXNlbHZlcwp0aGVuCnRoZW5jZQp0aGVyZQp0aGVyZSdzCnRoZXJlYWZ0ZXIKdGhlcmVieQp0",
+    "aGVyZWZvcmUKdGhlcmVpbgp0aGVyZXMKdGhlcmV1cG9uCnRoZXNlCnRoZXkKdGhleSdkCnRoZXkn",
+    "bGwKdGhleSdyZQp0aGV5J3ZlCnRoaW5rCnRoaXJkCnRoaXMKdGhvcm91Z2gKdGhvcm91Z2hseQp0",
+    "aG9zZQp0aG91Z2gKdGhyZWUKdGhyb3VnaAp0aHJvdWdob3V0CnRocnUKdGh1cwp0bwp0b2dldGhl",
+    "cgp0b28KdG9vawp0b3dhcmQKdG93YXJkcwp0cmllZAp0cmllcwp0cnVseQp0cnkKdHJ5aW5nCnR3",
+    "aWNlCnR3bwp1CnVuCnVuZGVyCnVuZm9ydHVuYXRlbHkKdW5sZXNzCnVubGlrZWx5CnVudGlsCnVu",
+    "dG8KdXAKdXBvbgp1cwp1c2UKdXNlZAp1c2VmdWwKdXNlcwp1c2luZwp1c3VhbGx5CnV1Y3AKdgp2",
+    "YWx1ZQp2YXJpb3VzCnZlcnkKdmlhCnZpegp2cwp3CndhbnQKd2FudHMKd2FzCndhc24ndAp3YXkK",
+    "d2UKd2UnZAp3ZSdsbAp3ZSdyZQp3ZSd2ZQp3ZWxjb21lCndlbGwKd2VudAp3ZXJlCndlcmVuJ3QK",
+    "d2hhdAp3aGF0J3MKd2hhdGV2ZXIKd2hlbgp3aGVuY2UKd2hlbmV2ZXIKd2hlcmUKd2hlcmUncwp3",
+    "aGVyZWFmdGVyCndoZXJlYXMKd2hlcmVieQp3aGVyZWluCndoZXJldXBvbgp3aGVyZXZlcgp3aGV0",
+    "aGVyCndoaWNoCndoaWxlCndoaXRoZXIKd2hvCndobydzCndob2V2ZXIKd2hvbGUKd2hvbQp3aG9z",
+    "ZQp3aHkKd2lsbAp3aWxsaW5nCndpc2gKd2l0aAp3aXRoaW4Kd2l0aG91dAp3b24ndAp3b25kZXIK",
+    "d291bGQKd291bGQKd291bGRuJ3QKeAp5Cnllcwp5ZXQKeW91CnlvdSdkCnlvdSdsbAp5b3UncmUK",
+    "eW91J3ZlCnlvdXIKeW91cnMKeW91cnNlbGYKeW91cnNlbHZlcwp6Cnplcm8K"])
+
+# ----------------------------------------------------------------------------------------------------------------------
+def is_number(s):
+    try:
+        float(s) if '.' in s else int(s)
+        return True
+    except ValueError:
+        return False
+
+# ----------------------------------------------------------------------------------------------------------------------
+def load_stop_words(stop_word_file=""):
+    """
+    Utility function to load stop words from a file and return as a list of words
+    @param stop_word_file Path and file name of a file containing stop words.
+    @return list A list of stop words.
+    """
+    lines = base64.b64decode(smart_stop_list).decode('utf-8').splitlines()
+
+    stop_words = []
+    for line in (open(stop_word_file) if stop_word_file != "" else lines):
+        if line.strip()[0:1] != "#":
+            for word in line.split():  # in case more than one per line
+                stop_words.append(word)
+    return stop_words
+
+# ----------------------------------------------------------------------------------------------------------------------
+def separate_words(text, min_word_return_size):
+    """
+    Utility function to return a list of all words that are have a length greater than a specified number of characters.
+    @param text The text that must be split in to words.
+    @param min_word_return_size The minimum no of characters a word must have to be included.
+    """
+    splitter = re.compile('[^a-zA-Z0-9_\\+\\-/]')
+    words = []
+    for single_word in splitter.split(text):
+        current_word = single_word.strip().lower()
+        #leave numbers in phrase, but don't count as words, since they tend to invalidate scores of their phrases
+        if len(current_word) > min_word_return_size and current_word != '' and not is_number(current_word):
+            words.append(current_word)
+    return words
+
+# ----------------------------------------------------------------------------------------------------------------------
+def split_sentences(text):
+    """
+    Utility function to return a list of sentences.
+    @param text The text that must be split in to sentences.
+    """
+    sentence_delimiters = re.compile(u'[.!?,\n;:\t\\\\"\\(\\)\\\'\u2019\u2013]|\\s\\-\\s')
+    sentences = sentence_delimiters.split(text)
+    return sentences
+
+# ----------------------------------------------------------------------------------------------------------------------
+def build_stop_word_regex(stop_word_file_path):
+    stop_word_list = load_stop_words(stop_word_file_path)
+    stop_word_regex_list = []
+    for word in stop_word_list:
+        word_regex = r'\b' + word + r'(?![\w-])'  # added look ahead for hyphen
+        stop_word_regex_list.append(word_regex)
+    stop_word_pattern = re.compile('|'.join(stop_word_regex_list), re.IGNORECASE)
+    return stop_word_pattern
+
+# ----------------------------------------------------------------------------------------------------------------------
+def generate_candidate_keywords(sentence_list, stopword_pattern):
+    phrase_list = []
+    for s in sentence_list:
+        tmp = re.sub(stopword_pattern, '|', s.strip())
+        phrases = tmp.split("|")
+        for phrase in phrases:
+            phrase = phrase.strip().lower()
+            if phrase != "":
+                phrase_list.append(phrase)
+    return phrase_list
+
+# ----------------------------------------------------------------------------------------------------------------------
+def calculate_word_scores(phraseList):
+    word_frequency = {}
+    word_degree = {}
+    for phrase in phraseList:
+        word_list = separate_words(phrase, 0)
+        word_list_length = len(word_list)
+        word_list_degree = word_list_length - 1
+        #if word_list_degree > 3: word_list_degree = 3 #exp.
+        for word in word_list:
+            word_frequency.setdefault(word, 0)
+            word_frequency[word] += 1
+            word_degree.setdefault(word, 0)
+            word_degree[word] += word_list_degree  #orig.
+            #word_degree[word] += 1/(word_list_length*1.0) #exp.
+    for item in word_frequency:
+        word_degree[item] = word_degree[item] + word_frequency[item]
+
+    # Calculate Word scores = deg(w)/frew(w)
+    word_score = {}
+    for item in word_frequency:
+        word_score.setdefault(item, 0)
+        word_score[item] = word_degree[item] / (word_frequency[item] * 1.0)  #orig.
+    #word_score[item] = word_frequency[item]/(word_degree[item] * 1.0) #exp.
+    return word_score
+
+# ----------------------------------------------------------------------------------------------------------------------
+def generate_candidate_keyword_scores(phrase_list, word_score):
+    keyword_candidates = {}
+    for phrase in phrase_list:
+        keyword_candidates.setdefault(phrase, 0)
+        word_list = separate_words(phrase, 0)
+        candidate_score = 0
+        for word in word_list:
+            candidate_score += word_score[word]
+        keyword_candidates[phrase] = candidate_score
+    return keyword_candidates
+
+# ----------------------------------------------------------------------------------------------------------------------
+class Rake(object):
+
+    def __init__(self, stop_words_path=""):
+        self.stop_words_path = stop_words_path
+        self.__stop_words = load_stop_words(stop_words_path)
+        self.__stop_words_pattern = build_stop_word_regex(stop_words_path)
+
+    def run(self, text):
+        sentence_list = split_sentences(text)
+        phrase_list = generate_candidate_keywords(sentence_list, self.__stop_words_pattern)
+        word_scores = calculate_word_scores(phrase_list)
+        keyword_candidates = generate_candidate_keyword_scores(phrase_list, word_scores)
+        sorted_keywords = sorted(keyword_candidates.items(), key=operator.itemgetter(1), reverse=True)
+
+        return sorted_keywords
+
+    def get_stop_words(self):
+        return self.__stop_words
+
+# ----------------------------------------------------------------------------------------------------------------------
+def get_secrets() -> dict|None:
+
+    secrets = None
+
+    secretspath = os.path.join(ollama_conf_dir, 'secrets.json')
+    with open(secretspath) as f:
+        secrets = json.load(f)
+
+    return secrets
+
+# ----------------------------------------------------------------------------------------------------------------------
+def get_secret(key: str) -> any:
+
+    global secrets
+
+    if key in secrets:
+        return secrets[key]
+
+    return None
+
+# ----------------------------------------------------------------------------------------------------------------------
+def get_state() -> dict|None:
+    """
+    Get the state of the assistant
+    """
+    initState = {
+        'gcloudSearchCount': {}
+    }
+
+    statepath = os.path.join(ollama_conf_dir, 'state.json')
+
+    if not os.path.isfile(statepath):
+        with open(statepath, 'w', encoding='utf-8') as f:
+            json.dump(initState, f, ensure_ascii=False, indent=4)
+            return initState
+
+    with open(statepath) as f:
+        return json.load(f)
+
+# ----------------------------------------------------------------------------------------------------------------------
+def save_state():
+    """
+    Save the state of the assistant
+    """
+    global state
+
+    statepath = os.path.join(ollama_conf_dir, 'state.json')
+
+    with open(statepath, 'w') as f:
+        json.dump(state, f)
+
+# Register the save_state handler so that the state is always saved when the script terminates
+atexit.register(save_state)
+
+# ----------------------------------------------------------------------------------------------------------------------
+def state_accumulate_search_count():
+    """
+    Updates the number of requests made by the assistant in the current day
+    """
+    current_date = datetime.datetime.now().strftime("%Y%m%d")
+
+    if current_date not in state['gcloudSearchCount']:
+        state['gcloudSearchCount'] = {current_date: 1}
+    else:
+        state['gcloudSearchCount'][current_date] += 1
+
+# ----------------------------------------------------------------------------------------------------------------------
+def extract_table_data(table):
+    """
+    Extract table from HTML table
+    """
+    headers = [th.text.strip() for th in table.find_all("th")]
+    rows = []
+
+    for tr in table.find_all("tr"):
+
+        if len(tr.find_all("th")) > 0:
+            # skip header
+            continue
+
+        row = [td.text.strip() for td in tr.find_all("td")]
+        if len(row) != len(headers):
+            return [], []
+
+        rows.append(row)
+
+    return headers, rows
+
+# ----------------------------------------------------------------------------------------------------------------------
+def format_ascii_table(title, headers, rows) -> str:
+
+    if rows is None or len(rows) == 0:
+        return "(empty table)"
+
+    t = texttable.Texttable()
+    table = []
+
+    if headers is not None and len(headers) > 0:
+        t.set_deco(texttable.Texttable.HEADER)
+        table.append(headers)
+
+    table.extend(rows)
+
+    t.add_rows(table)
+
+    output = io.StringIO()
+    print(t.draw(), file=output)
+    contents = output.getvalue()
+
+    return contents
+
+# ----------------------------------------------------------------------------------------------------------------------
+def google_search(query) -> list|None:
+    """
+    Google search
+    """
+    global headers
+
+    parsed_query = urllib.parse.quote_plus(query)
+
+    url = "?".join([
+        "https://customsearch.googleapis.com/customsearch/v1",
+        "&".join([
+            "key={}".format(get_secret('gcloudApiKey')),
+            "cx={}".format(get_secret('gcloudSearchId')),
+            "q={}".format(parsed_query),
+            "&num={}".format(search_num_results)
+        ])
+    ])
+
+    r = httpx.get(url, headers={'Accept': 'application/json'})
+
+    result = json.loads(r.text)
+    state_accumulate_search_count()
+
+    if 'items' not in result:
+        return None
+
+    items = result['items']
+
+    documents = ""
+    for item in items:
+
+        if not item.keys() >= {'link', 'title'}:
+            continue
+
+        title = item['title']
+        link = item['link']
+
+        ir = httpx.get(link)
+
+        # https://stackoverflow.com/questions/328356/extracting-text-from-html-file-using-python
+        soup = bs4.BeautifulSoup(ir.text, features="html.parser")
+
+        # kill all script and style elements
+        # TODO clean up more elements that may not be needed
+        for unwanted in soup(["script", "style", "header", "footer", "iframe"]):
+            unwanted.extract()    # rip it out
+
+        # get tables
+        tables = soup(["table"])
+        printed_tables = []
+        for table in tables:
+            table.extract()
+            headers, rows = extract_table_data(table)
+            pt = format_ascii_table("title", headers, rows)
+            if pt is None:
+                print([headers, rows])
+            else:
+                printed_tables.append(pt)
+
+        body = soup.find("body")
+        if body is None:
+            continue
+
+        extract = body.get_text(separator=' ', strip=True)
+        # remove multiple CRLF and multiple spaces
+        re.sub(r"(\n( ?))+", "\n", extract)
+        re.sub(r"   +", "  ", extract)
+
+        documents += "Title: "+title+"\n"
+        documents += "URL: "+link+"\n"
+        documents += "Extract:\n"+extract+"\n"
+        documents += "Tables:\n"+"\n".join(printed_tables)
+        documents += "\n"
+
+    return documents
+
+# ----------------------------------------------------------------------------------------------------------------------
+def wikipedia_search(query) -> list|None:
+    """
+    Wikipedia search
+    """
+    global headers
+    parsed_query = urllib.parse.quote_plus(query)
+
+    url = "?".join([
+        "https://en.wikipedia.org/w/api.php",
+        "&".join([
+            "action=query",
+            "list=search",
+            "srsearch={}".format(parsed_query),
+            "&utf8=",
+            "format=json"
+        ])
+    ])
+
+    r = httpx.get(url, headers=headers)
+
+    results = json.loads(r.text)
+
+    if 'query' not in results:
+        return None
+
+    if 'search' not in results['query']:
+        return None
+
+    search_results = results['query']['search']
+
+    page_url = "?".join([
+        "https://en.wikipedia.org/w/api.php",
+        "&".join([
+            "action=query",
+            "format=json",
+            "prop=extracts",
+            "explaintext",
+            "exintro",
+            "pageids={}"
+        ])
+    ])
+
+    result = [{ 'title': r['title'], 'pageid': r['pageid'] } for r in search_results]
+
+    documents = ""
+    for res in result[:min(len(result), search_num_results)]:
+        pageid = res['pageid']
+        title = res['title']
+
+        url = page_url.format(pageid)
+
+        r = httpx.get(url, headers=headers)
+
+        page = json.loads(r.text)
+
+        extract = page['query']['pages'][str(pageid)]['extract']
+
+        documents += "Title: "+title+"\n"
+        documents += "URL: https://en.wikipedia.org/?curid="+str(pageid)+"\n"
+        documents += "Extract:\n"+extract+"\n\n\n"
+
+    return documents
+
+# ----------------------------------------------------------------------------------------------------------------------
+def online_search_retrieval(prompt):
+
+    rake = Rake()
+
+    keywords = rake.run(prompt)
+
+    print("Search keywords: ", end=" ")
+    print(keywords)
+
+    keywords = " ".join( [text for text, score in keywords[:min(len(keywords), search_num_keywords)] ])
+
+    result = ""
+    if opts.wikipedia:
+        result += wikipedia_search(keywords)
+
+    if opts.google:
+        result += google_search(keywords)
+
+    return ("Use the following search results to provide a better informed, concise and short answer." \
+        "At the end, cite any document sources used.\n", result)
+
+# ----------------------------------------------------------------------------------------------------------------------
+def read_prompt() -> str|None:
+    """
+    Read prompt from command line or file
+    """
+    prompt = opts.input
+
+    if opts.input_file != "":
+        with open(opts.input_file) as f:
+            prompt = f.read()
+
+    return prompt
+
+# ----------------------------------------------------------------------------------------------------------------------
+def get_conversation() -> list:
+    """
+    Load conversation from file
+    """
+    messages = []
+
+    if opts.topic is not None:
+        filepath = os.path.join(ollama_chat_dir, opts.topic + ".json")
+        if os.path.isfile(filepath):
+            with open(filepath) as f:
+                messages = json.load(f)
+
+    if len(messages) == 0 and opts.system is not None:
+        messages.append({"role": "system", "content": opts.system})
+
+    return messages
+
+# ----------------------------------------------------------------------------------------------------------------------
+def update_conversation(role: str, text: str):
+    """
+    Update conversation
+    """
+    if opts.topic is None:
+        return
+
+    filepath = os.path.join(ollama_chat_dir, opts.topic + ".json")
+
+    messages = get_conversation()
+    messages.append({
+        "role": role,
+        "content": text
+    })
+
+    with open(filepath, 'w', encoding='utf-8') as f:
+        json.dump(messages, f, ensure_ascii=False, indent=4)
+
+# ----------------------------------------------------------------------------------------------------------------------
+def ollama_chat():
+    """
+    Chat with Ollama
+    """
+    endpoint = "/api/chat"
+
+    messages = get_conversation()
+
+    content = opts.input
+
+    documents = ""
+    if opts.wikipedia or opts.google:
+        prompt, documents = online_search_retrieval(opts.input)
+        content += prompt + documents
+
+    messages.append({
+        "role": "user",
+        "content": content
+    })
+
+
+    payload = {
+        "model": opts.model,
+        "stream": opts.stream,
+        "options":{
+            "temperature": opts.temperature,
+            "num_thread": 14,
+            "num_ctx": 4096, 
+            "top_k": 20,
+            "top_p": 0.7,
+            "num_predict": 2048
+        },
+        "messages": messages
+    }
+
+    url = urllib.parse.urljoin(ollama_url, endpoint)
+
+    role = None
+    
+    response_text = ""
+
+    try:
+        with requests.post(url, json=payload, stream=True) as response:
+
+            for line in response.iter_lines():
+
+                data = json.loads(line)
+                if 'message' in data:
+
+                    message = data['message']
+
+                    if role is None:
+                        role = message['role'] if 'role' in message else None
+
+                    content = message['content'] if 'content' in message else ""
+                    response_text += f"{content}"
+                    
+                    print(content, end='', flush=True)
+
+                if 'done' in data and data['done']:
+                    # Get statistics from ollama
+                    print('', flush=True)
+                    break
+
+    except requests.exceptions.Timeout:
+        # Maybe set up for a retry, or continue in a retry loop
+        pass
+    except requests.exceptions.TooManyRedirects:
+        # Tell the user their URL was bad and try a different one
+        pass
+    except requests.exceptions.ConnectionError as e:
+        print("\nError connecting to {} (connection refused)".format(url))
+        sys.exit(0)
+    except requests.exceptions.RequestException as e:
+        # catastrophic error. bail.
+        raise SystemExit(e)
+
+    except KeyboardInterrupt:
+        print("\nReceived Ctrl+C. Exiting...")
+        sys.exit(0)
+
+    update_conversation("user", opts.input)
+    update_conversation(role, response_text)
+
+    if opts.documents and (opts.google or opts.wikipedia):
+        row, cols = os.get_terminal_size()
+        print("\n"+"".join(["-"*cols])+"\n\nDocuments:")
+        print(documents)
+
+# ----------------------------------------------------------------------------------------------------------------------
+def parse_args():
+    """
+    Parse command line arguments
+    """
+    parser = argparse.ArgumentParser(description='Ollama command line client')
+    parser.add_argument('-i', '--input-file', type=str, default='', help='Input file')
+    parser.add_argument('-m', '--model', type=str, help='Model to use')
+    parser.add_argument('-s', '--system', type=str, help='Initial system prompt')
+    parser.add_argument('-t', '--topic', type=str, help='Chat topic')
+
+    parser.add_argument('-d', '--documents', action='store_true', help='Show retrieved documents')
+    parser.add_argument('-g', '--google', action='store_true', help='Search Google for relevant documents')
+    parser.add_argument('-w', '--wikipedia', action='store_true', help='Search Wikipedia for relevant documents')
+
+    # use capital letters for model options
+    parser.add_argument('-T', '--temperature', type=str, default='0.4', help='LLM temperature (default: 0.4)')
+    parser.add_argument('-S', '--stream', action='store_true', help='Whether the LLM should stream the response tokens')
+
+    parser.add_argument('input', help='input prompt')
+
+    opts = parser.parse_args()
+
+    # default model
+    if opts.model is None:
+        opts.model = ollama_chat_model
+
+    opts.stream = True if (opts.stream is not None and opts.stream is True) else False
+    opts.temperature = float(opts.temperature)
+
+    return opts
+
+def main():
+    """
+    Main function
+    """
+    global state
+    global secrets
+    global opts
+
+    state = get_state()
+    secrets = get_secrets()
+
+    opts = parse_args()
+
+    if not os.path.isdir(ollama_chat_dir):
+        os.makedirs(ollama_chat_dir)
+
+    ollama_chat()
+
+if __name__ == "__main__":
+
+    main()
