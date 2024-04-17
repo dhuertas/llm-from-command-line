@@ -1,4 +1,4 @@
-# llm-from-command-line
+# ollama-from-command-line
 Access Ollama LLMs from the command line.
 
 ## How to use it
